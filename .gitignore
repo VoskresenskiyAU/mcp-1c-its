@@ -1,0 +1,16 @@
+# учётные данные — никогда не коммитить
+its_credentials.txt
+*.cred
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# кэш и служебное
+cache/
+.uv/

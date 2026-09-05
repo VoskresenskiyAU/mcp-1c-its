@@ -1,0 +1,38 @@
+[project]
+name = "mcp-1c-its"
+version = "0.1.0"
+description = "MCP-сервер доступа к порталу 1С:ИТС (its.1c.ru): поиск и чтение материалов по подписке"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AUTOFIN developer" }]
+keywords = ["mcp", "1c", "its", "1С:ИТС", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "mcp>=1.2",
+    "httpx>=0.27",
+    "trafilatura>=1.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-login/mcp-1c-its"
+
+[project.scripts]
+mcp-1c-its = "mcp_1c_its.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_1c_its"]
