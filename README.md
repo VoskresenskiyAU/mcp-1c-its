@@ -36,7 +36,7 @@ uv сам скачает изолированный Python и зависимос
 репозитория:
 
 ```bash
-git clone https://github.com/<логин>/mcp-1c-its
+git clone https://github.com/VoskresenskiyAU/mcp-1c-its
 cd mcp-1c-its
 uv sync
 uv run mcp-1c-its   # проверка, что сервер стартует (Ctrl+C для выхода)
@@ -47,7 +47,7 @@ uv run mcp-1c-its   # проверка, что сервер стартует (Ct
 ### Вариант 2 — системный Python (3.10+)
 
 ```bash
-git clone https://github.com/<логин>/mcp-1c-its
+git clone https://github.com/VoskresenskiyAU/mcp-1c-its
 cd mcp-1c-its
 python -m pip install .
 ```

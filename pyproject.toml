@@ -5,7 +5,7 @@ description = "MCP-сервер доступа к порталу 1С:ИТС (its
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "AUTOFIN developer" }]
+authors = [{ name = "VoskresenskiyAU" }]
 keywords = ["mcp", "1c", "its", "1С:ИТС", "model-context-protocol"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/your-login/mcp-1c-its"
+Homepage = "https://github.com/VoskresenskiyAU/mcp-1c-its"
 
 [project.scripts]
 mcp-1c-its = "mcp_1c_its.server:main"
