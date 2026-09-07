@@ -26,7 +26,8 @@ Context Protocol) доступ к трём ресурсам фирмы «1С» *
 
 Сервер сам хранит вход по подписке (логин и пароль лежат в локальном файле и
 никак не отдаются агенту), бережно ходит на порталы (не чаще запроса в секунду,
-кэш на неделю) и отдаёт материалы в Markdown со ссылкой на источник.
+кэширует: материалы — на неделю, поиск — на сутки) и отдаёт материалы в
+Markdown со ссылкой на источник.
 
 ## Инструменты
 
@@ -67,14 +68,28 @@ winget install astral-sh.uv
 # или PowerShell: irm https://astral.sh/uv/install.ps1 | iex
 ```
 
-uv сам скачает изолированный Python и зависимости. Для запуска из этого
-репозитория:
+uv сам скачает изолированный Python и зависимости. Проще всего — запуск
+напрямую из этого репозитория, без клонирования:
+
+```bash
+uvx --from git+https://github.com/VoskresenskiyAU/mcp-1c-its mcp-1c-its
+```
+
+(команда запустит сервер и будет молча ждать — это норма для stdio;
+Ctrl+C для выхода). Для клиента в конфигурации:
+
+```json
+"1c-its": { "command": "uvx",
+            "args": ["--from", "git+https://github.com/VoskresenskiyAU/mcp-1c-its", "mcp-1c-its"] }
+```
+
+Для разработки или без сети — из локальной копии:
 
 ```bash
 git clone https://github.com/VoskresenskiyAU/mcp-1c-its
 cd mcp-1c-its
 uv sync
-uv run mcp-1c-its   # проверка, что сервер стартует (Ctrl+C для выхода)
+uv run mcp-1c-its
 ```
 
 После публикации пакета на PyPI запуск упростится до `uvx mcp-1c-its`.
@@ -120,7 +135,8 @@ ITS_PASS=ваш_пароль
 
 Конкретные значения `command`/`args`:
 
-- **uv из репозитория**: `uv`, `["--directory", "<путь к репозиторию>", "run", "mcp-1c-its"]`
+- **uvx из GitHub (без клонирования)**: `uvx`, `["--from", "git+https://github.com/VoskresenskiyAU/mcp-1c-its", "mcp-1c-its"]`
+- **uv из локальной копии**: `uv`, `["--directory", "<путь к репозиторию>", "run", "mcp-1c-its"]`
 - **pip-установка**: `python`, `["-m", "mcp_1c_its.server"]`
 - **ZCode**: раздел `mcp.servers` файла `~/.zcode/cli/config.json`
 - **Claude Desktop / Cursor**: раздел `mcpServers` их конфигурации
@@ -133,7 +149,9 @@ ITS_PASS=ваш_пароль
 python -m mcp_1c_its.check     # или: uv run python -m mcp_1c_its.check
 ```
 
-Должно показать «Вход в ИТС: успешен» и пробный поиск. Через агента —
+Должно показать «Вход в ИТС: успешен» и пробный поиск (проверяется ИТС-часть;
+доступ к releases и bugboard проще всего проверить через агент: попросите
+«покажи исправления Бухгалтерии» или «проверь its_status»). Через агента —
 попросить «проверь its_status».
 
 ## Ограничения и заметки
@@ -149,7 +167,7 @@ python -m mcp_1c_its.check     # или: uv run python -m mcp_1c_its.check
 ```bash
 python -m pip install -e .          # редактируемая установка
 python -m mcp_1c_its.check          # проверка
-python -m build                     # сборка пакета (dist/)
+uv build                            # сборка пакета (dist/); pip-путь: pip install build && python -m build
 ```
 
 Структура: `src/mcp_1c_its/server.py` — сервер, `src/mcp_1c_its/check.py` —
