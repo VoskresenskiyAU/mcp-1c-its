@@ -79,6 +79,7 @@ _CRED_SOURCE = _load_credentials()
 
 BASE = "https://its.1c.ru"
 LOGIN_BASE = "https://login.1c.ru"
+RELEASES_BASE = "https://releases.1c.ru"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -148,8 +149,10 @@ mcp = FastMCP(
         "Схема работы: its_search — найти материалы (по умолчанию по всем "
         "разделам), затем its_get — получить текст выбранного материала "
         "в Markdown по адресу (path) из результата поиска. its_sections — "
-        "доступные разделы, its_status — самопроверка. Учётные данные "
-        "сервер хранит у себя и наружу не отдаёт."
+        "доступные разделы, its_status — самопроверка. Дополнительно: "
+        "releases_products и releases_patches — версии типовых конфигураций "
+        "и списки их исправлений (EF_...) с releases.1c.ru по той же "
+        "подписке. Учётные данные сервер хранит у себя и наружу не отдаёт."
     ),
 )
 
@@ -231,6 +234,12 @@ def _normalize_path(url_or_path):
     s = re.sub(r"^https?://its\.1c\.ru", "", s, flags=re.I)
     m = re.match(r"^/db/[a-z0-9_]+/content/\d+(?:/hdoc)?", s, re.I)
     return m.group(0) if m else s
+
+
+def _strip_tags(fragment):
+    """Текст из html-фрагмента: без тегов, без сплошных пробелов."""
+    return html_lib.unescape(
+        re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", fragment))).strip()
 
 
 def _cache_key(path):
@@ -404,6 +413,94 @@ def get_raw(url_or_path):
     return result
 
 
+# ------------------------------------------------- релизы и исправления
+# releases.1c.ru входит в подписку ИТС и открывается той же учётной записью:
+# после входа в ИТС кука TGC единого входа пропускает и на releases.
+
+def _releases_page(path, **params):
+    """Страница releases.1c.ru; при истёкшей сессии — перезаход в ИТС."""
+    _ensure_session()
+    resp = _get(f"{RELEASES_BASE}{path}", params=params or None)
+    txt = _text(resp)
+    if "loginForm" in txt or "login.1c.ru" in str(resp.url):
+        _login()
+        resp = _get(f"{RELEASES_BASE}{path}", params=params or None)
+        txt = _text(resp)
+    if resp.status_code != 200:
+        return None, f"Ошибка releases.1c.ru: HTTP {resp.status_code}"
+    return txt, None
+
+
+def products_raw(query=""):
+    """Конфигурации с releases.1c.ru/total: название, ник, версии."""
+    key = f"products:{query.lower()}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    txt, err = _releases_page("/total")
+    if err:
+        return err
+    out, seen = [], set()
+    for tr in re.findall(r"<tr[^>]*>.*?</tr>", txt, re.S):
+        m_nick = re.search(r"nick=([A-Za-z0-9_]+)", tr)
+        if not m_nick:
+            continue
+        nick = m_nick.group(1)
+        if nick in seen:
+            continue
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        name = _strip_tags(tds[0]) if tds else ""
+        if not name:
+            continue
+        seen.add(nick)
+        vers = sorted(set(re.findall(r"\d+\.\d+\.\d+\.\d+", tr)))[-2:]
+        line = f"- {name} — {nick}"
+        if vers:
+            line += f" — версии: {', '.join(vers)}"
+        if query and query.lower() not in line.lower():
+            continue
+        out.append(line)
+    if not out:
+        return ("Ничего не найдено. Уточните запрос: например, "
+                "«Бухгалтерия», «Зарплата», «ERP».")
+    result = (f"Продукты releases.1c.ru"
+              f"{' по запросу «' + query + '»' if query else ''}, "
+              f"найдено: {len(out)}\n" + "\n".join(out[:50]))
+    _cache_put(key, result)
+    return result
+
+
+def patches_raw(nick, ver):
+    """Исправления (баг-фиксы) версии конфигурации с releases.1c.ru."""
+    key = f"patches:{nick}:{ver}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    txt, err = _releases_page("/patches/total", nick=nick, ver=ver)
+    if err:
+        return err
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>.*?</tr>", txt, re.S):
+        tds = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        if len(tds) < 4:
+            continue
+        name, descr, date = (_strip_tags(tds[1]), _strip_tags(tds[2]),
+                             _strip_tags(tds[3]))
+        if not name:
+            continue
+        line = f"- {name} ({date})"
+        if descr:
+            line += f" — {descr}"
+        rows.append(line)
+    if not rows:
+        return (f"Исправления для {nick} версии {ver} не найдены. "
+                "Проверьте ник (releases_products) и номер версии.")
+    result = (f"Исправления {nick} версия {ver}, всего: {len(rows)}\n"
+              + "\n".join(rows[:60]))
+    _cache_put(key, result)
+    return result
+
+
 @mcp.tool()
 def its_search(query: str, section: str = "morphmerged") -> str:
     """Поиск по порталу 1С:ИТС. Возвращает заголовки и адреса (path)
@@ -446,6 +543,23 @@ def its_status() -> str:
     except Exception as exc:
         lines.append(f"Сессия ИТС: ошибка — {exc}")
     return "\n".join(lines)
+
+
+@mcp.tool()
+def releases_products(query: str = "") -> str:
+    """Продукты и типовые конфигурации с releases.1c.ru: название, ник
+    (для releases_patches) и актуальные версии. query — подстрока для
+    фильтра, например «Бухгалтерия», «Зарплата», «ERP»; пусто — все."""
+    return _safe(products_raw, query)
+
+
+@mcp.tool()
+def releases_patches(nick: str, ver: str) -> str:
+    """Список исправлений (баг-фиксов EF_...) конкретной версии типовой
+    конфигурации с releases.1c.ru. nick и ver — из результата
+    releases_products, например nick=Accounting30, ver=3.0.203.24.
+    Номер EF_... можно искать на bugboard.1c.ru вручную."""
+    return _safe(patches_raw, nick, ver)
 
 
 def main():

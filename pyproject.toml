@@ -1,6 +1,6 @@
 [project]
 name = "mcp-1c-its"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP-сервер доступа к порталу 1С:ИТС (its.1c.ru): поиск и чтение материалов по подписке"
 readme = "README.md"
 requires-python = ">=3.10"
