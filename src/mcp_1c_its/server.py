@@ -484,6 +484,29 @@ def products_raw(query=""):
     return result
 
 
+def _history_versions(nick):
+    """Релизы проекта с /project/<nick>, свежие сверху:
+    [(версия, дата, список_обновления_с, мин_платформа), …]."""
+    txt, err = _releases_page(f"/project/{nick}")
+    if err:
+        raise RuntimeError(err)
+    out = []
+    for tr in re.findall(r"<tr[^>]*>.*?</tr>", txt, re.S):
+        tds = [re.findall(r"\d+\.\d+\.\d+\.\d+", td) for td in
+               re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if len(tds) < 4 or not tds[0]:
+            continue
+        m = re.search(r"\d{2}\.\d{2}\.\d{2,4}", tr)
+        date = m.group(0) if m else "?"
+        if re.match(r"^\d{2}\.\d{2}\.\d{2}$", date):
+            date = date[:-2] + "20" + date[-2:]
+        out.append((tds[0][0], date, tds[2], tds[3][0] if tds[3] else "?"))
+    if not out:
+        raise RuntimeError(f"Релизы проекта {nick} не найдены — проверьте код "
+                           "продукта (releases_products).")
+    return out
+
+
 def history_raw(nick, limit=15):
     """История релизов проекта с releases.1c.ru/project/<nick>."""
     nick = (nick or "").strip()
@@ -492,34 +515,52 @@ def history_raw(nick, limit=15):
     cached = _cache_get(key, SEARCH_TTL)
     if cached:
         return cached
-    txt, err = _releases_page(f"/project/{nick}")
-    if err:
-        return err
     rows = []
-    for tr in re.findall(r"<tr[^>]*>.*?</tr>", txt, re.S):
-        tds = [re.findall(r"\d+\.\d+\.\d+\.\d+", td) for td in
-               re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
-        if len(tds) < 4 or not tds[0]:
-            continue
-        ver = tds[0][0]
-        m = re.search(r"\d{2}\.\d{2}\.\d{2,4}", tr)
-        date = m.group(0) if m else "?"
-        if re.match(r"^\d{2}\.\d{2}\.\d{2}$", date):
-            date = date[:-2] + "20" + date[-2:]
-        update_from = tds[2]
-        pf = tds[3][0] if tds[3] else "?"
+    for ver, date, update_from, pf in _history_versions(nick):
         upd = (f"обновление с {update_from[0]}"
                + (f" и ещё {len(update_from) - 1}" if len(update_from) > 1 else "")
                if update_from else "без ограничения версии")
         rows.append(f"- {ver} от {date} ({upd}; платформа ≥ {pf})")
-    if not rows:
-        return (f"Релизы проекта {nick} не найдены. Проверьте код продукта "
-                "(releases_products).")
     result = (f"Релизы {nick} (свежие сверху), показано "
               f"{min(limit, len(rows))} из {len(rows)}:\n"
               + "\n".join(rows[:limit]))
     _cache_put(key, result)
     return result
+
+
+def where_fixed_raw(nick, number, depth=8):
+    """Где исправление доступно: в каких версиях — багфиксом, в какой
+    версии оно встроено в сам релиз."""
+    nick = (nick or "").strip()
+    num = re.sub(r"(?i)^EF_", "", (number or "").strip()).replace("_", "-")
+    depth = max(2, min(int(depth), 15))
+    key = f"wherefixed:{nick}:{num}:{depth}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    versions = [v for v, *_ in _history_versions(nick)][:depth]
+    present = []
+    for ver in versions:
+        if num in patches_raw(nick, ver):   # списки кэшируются сами
+            present.append(ver)
+    if not present:
+        return (f"Исправление {num} не найдено в багфиксах {len(versions)} "
+                f"последних версий {nick}. Возможно, оно старше — увеличьте "
+                "depth, или номера на bugboard/releases различаются.")
+    # версии свежие сверху: если фикс есть в самой свежей — он ещё не вшит
+    # в релиз; первая версия выше самой свежей с фиксом — релиз с фиксом
+    idx_newest_with = min(versions.index(v) for v in present)
+    if idx_newest_with == 0:
+        verdict = (f"Исправление {num} пока доступно только как багфикс — "
+                   f"в состав релиза ещё не вошло (есть в багфиксах: "
+                   f"{', '.join(present)}).")
+    else:
+        built_in = versions[idx_newest_with - 1]
+        verdict = (f"Исправление {num} встроено в релиз {built_in}; "
+                   f"для более старых версий доступно багфиксами: "
+                   f"{', '.join(present)}.")
+    _cache_put(key, verdict)
+    return verdict
 
 
 def patches_raw(nick, ver):
@@ -918,6 +959,16 @@ def releases_history(nick: str, limit: int = 15) -> str:
     платформы. nick — код продукта из releases_products
     (например Accounting30); свежие версии сверху."""
     return _safe(history_raw, nick, limit)
+
+
+@mcp.tool()
+def releases_where_fixed(nick: str, number: str, depth: int = 8) -> str:
+    """В каком релизе исправление вошло в состав самой конфигурации, а в
+    каких доступно только багфиксом. nick — код продукта
+    (releases_products), number — номер исправления EF_... (или без
+    префикса). depth — сколько последних релизов просмотреть (2-15);
+    списки исправлений кэшируются, повторные вызовы быстрые."""
+    return _safe(where_fixed_raw, nick, number, depth)
 
 
 @mcp.tool()
