@@ -152,8 +152,9 @@ mcp = FastMCP(
         "разделам), затем its_get — получить текст выбранного материала "
         "в Markdown по адресу (path) из результата поиска. its_sections — "
         "доступные разделы, its_status — самопроверка. Дополнительно: "
-        "releases_products и releases_patches — версии типовых конфигураций "
-        "и списки их исправлений (EF_...) с releases.1c.ru; bugboard_card, "
+        "releases_products, releases_patches и releases_history — версии, "
+        "исправления (EF_...) и историю релизов типовых конфигураций "
+        "с releases.1c.ru; bugboard_card, "
         "bugboard_version_errors и bugboard_versions — доска ошибок 1С "
         "(bugboard.1c.ru): карточка ошибки по EF-номеру, ошибки версии "
         "конфигурации, последние версии. Всё — по той же подписке. "
@@ -479,6 +480,44 @@ def products_raw(query=""):
     result = (f"Продукты releases.1c.ru"
               f"{' по запросу «' + query + '»' if query else ''}, "
               f"найдено: {len(out)}\n" + "\n".join(out[:50]))
+    _cache_put(key, result)
+    return result
+
+
+def history_raw(nick, limit=15):
+    """История релизов проекта с releases.1c.ru/project/<nick>."""
+    nick = (nick or "").strip()
+    limit = max(1, min(int(limit), 40))
+    key = f"history:{nick}:{limit}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    txt, err = _releases_page(f"/project/{nick}")
+    if err:
+        return err
+    rows = []
+    for tr in re.findall(r"<tr[^>]*>.*?</tr>", txt, re.S):
+        tds = [re.findall(r"\d+\.\d+\.\d+\.\d+", td) for td in
+               re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if len(tds) < 4 or not tds[0]:
+            continue
+        ver = tds[0][0]
+        m = re.search(r"\d{2}\.\d{2}\.\d{2,4}", tr)
+        date = m.group(0) if m else "?"
+        if re.match(r"^\d{2}\.\d{2}\.\d{2}$", date):
+            date = date[:-2] + "20" + date[-2:]
+        update_from = tds[2]
+        pf = tds[3][0] if tds[3] else "?"
+        upd = (f"обновление с {update_from[0]}"
+               + (f" и ещё {len(update_from) - 1}" if len(update_from) > 1 else "")
+               if update_from else "без ограничения версии")
+        rows.append(f"- {ver} от {date} ({upd}; платформа ≥ {pf})")
+    if not rows:
+        return (f"Релизы проекта {nick} не найдены. Проверьте код продукта "
+                "(releases_products).")
+    result = (f"Релизы {nick} (свежие сверху), показано "
+              f"{min(limit, len(rows))} из {len(rows)}:\n"
+              + "\n".join(rows[:limit]))
     _cache_put(key, result)
     return result
 
@@ -870,6 +909,15 @@ def releases_products(query: str = "") -> str:
     (для releases_patches) и актуальные версии. query — подстрока для
     фильтра, например «Бухгалтерия», «Зарплата», «ERP»; пусто — все."""
     return _safe(products_raw, query)
+
+
+@mcp.tool()
+def releases_history(nick: str, limit: int = 15) -> str:
+    """История релизов конфигурации с releases.1c.ru: номер версии, дата
+    выхода, с каких версий возможно обновление, минимальная версия
+    платформы. nick — код продукта из releases_products
+    (например Accounting30); свежие версии сверху."""
+    return _safe(history_raw, nick, limit)
 
 
 @mcp.tool()

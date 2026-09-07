@@ -39,7 +39,8 @@ Markdown со ссылкой на источник.
 | `its_search(query, section)` | Поиск по ИТС; по умолчанию по всем разделам (`morphmerged`) |
 | `its_get(path)` | Материал в Markdown по адресу из результата поиска |
 | `its_sections()` | Каталог разделов для поиска (36 разделов по группам) |
-| `releases_products(query)` | Типовые конфигурации с releases.1c.ru: название, ник, версии |
+| `releases_products(query)` | Типовые конфигурации с releases.1c.ru: название, код, версии |
+| `releases_history(nick)` | История релизов конфигурации: версия, дата выхода, с каких версий обновление, минимальная платформа |
 | `releases_patches(nick, ver)` | Список исправлений (баг-фиксов `EF_...`) версии конфигурации |
 | `bugboard_card(number, project)` | Карточка ошибки с bugboard.1c.ru по номеру `EF_...` |
 | `bugboard_search(project, ver, query)` | Поиск ошибок по симптомам: текст в заголовках/описаниях всех ошибок версии |
