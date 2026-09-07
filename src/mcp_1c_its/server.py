@@ -16,6 +16,7 @@ ITS_PASS=..., по одной на строку). Файл ищется по п�
 """
 import hashlib
 import html as html_lib
+import json
 import logging
 import os
 import re
@@ -658,18 +659,101 @@ def bugboard_card_raw(number, project=""):
         if not re.match(r"^[\d-]+$", num):
             return ("Укажите номер вида EF_00_00928768 (или 00-00928768, "
                     "60033691) и код проекта, либо полную ссылку/адрес страницы.")
-        if not project:
-            return ("Для поиска по номеру нужен код проекта bugboard "
-                    "(второй аргумент, например ssl22 или bp3), "
-                    "либо полная ссылка вида "
-                    "https://bugboard.1c.ru/?state=prj-ssl22-er-00-00928768")
-        state = f"prj-{project}-er-{num}"
+        if project:
+            state = f"prj-{project}-er-{num}"
+        else:
+            # глобальный поиск по номеру (bugboard ищет только по номеру,
+            # тексты/симптомы портал не индексирует)
+            res = _bb_call("e1c::bugboard::Компоненты::ПоискДанных::ПоискОшибок",
+                           "ВыполнитьПоискПоОшибкам", [("Std::String", num)])
+            items = (res.get("value", {}).get("НайденныеОшибки", {})
+                     .get("value", {}).get("items", []))
+            if len(items) == 1:
+                return _bb_card_md(_bb_read(BB_REF_ERROR, items[0]["value"]))
+            if not items:
+                return (f"Ошибка с номером {num} на bugboard не найдена. "
+                        "Проверьте номер; по симптомам bugboard не ищет — "
+                        "используйте releases_patches (там тексты исправлений).")
+            cards = [_bb_read(BB_REF_ERROR, it["value"]) for it in items[:5]]
+            listing = "\n".join(f"- {c.get('Name')}: {c.get('Заголовок', '')}"
+                                for c in cards)
+            return (f"Номер {num} нашёлся в {len(items)} проектах:\n{listing}\n"
+                    "Уточните код проекта вторым аргументом.")
     res = _bb_call(BB_ROUTING, "ПолучитьОшибкуПоФрагментуСсылкиИзURL",
                    [("Std::String", state)])
     if _bb_undef(res):
         return (f"Ошибка «{state}» на bugboard не найдена. Проверьте номер, "
                 "код проекта и что ошибка вообще опубликована на bugboard.")
     return _bb_card_md(_bb_read(BB_REF_ERROR, res["value"]))
+
+
+def _bb_export_cards(project, ver):
+    """Все карточки ошибок версии одной выгрузкой (bugboard, JSON)."""
+    key = f"bbexport:{project}:{ver}"
+    cached = _cache_get(key, CACHE_TTL)
+    if cached is not None:
+        return json.loads(cached)
+    proj = _bb_find_project(project)
+    vres = _bb_call(BB_ROUTING, "ПолучитьВерсиюПоНаименованиюИПроекту",
+                    [("Std::String", ver), (BB_REF_PROJECT, proj)])
+    if _bb_undef(vres):
+        raise RuntimeError(f"Версия {ver} проекта {project} на bugboard не найдена")
+    res = _bb_call(BB_VERSIONS, "ПолучитьМассивОшибокВВерсии",
+                   [(BB_REF_PROJECT, proj), (BB_REF_VERSION, vres["value"])])
+    val = res.get("value", {})
+    items = (val.get("МассивИсправленныхОшибокВВерсии", {})
+             .get("value", {}).get("items", [])
+             + val.get("МассивНеисправленныхОшибокВВерсии", {})
+             .get("value", {}).get("items", []))
+    if not items:
+        raise RuntimeError(f"У версии {ver} проекта {project} на bugboard "
+                           "ошибок не найдено")
+    arr = "Std::Collections::Array<e1c::bugboard::Багборд::Ошибки.Reference>"
+    export = _bb_call("e1c::bugboard::ВыгрузкаОшибок::ВыгрузкаОшибокВФайл",
+                      "ВыгрузитьОшибкиВВерсииВJSON",
+                      [(arr, {"items": items}),
+                       (BB_REF_VERSION, vres["value"]),
+                       (BB_REF_PROJECT, proj)])
+    binref = export.get("value")
+    if not binref:
+        raise RuntimeError("bugboard: выгрузка не вернула файл")
+    r = _get(f"{BB_BASE}/sys/binary/{binref}", headers={"X-G5-Version": _bb_ver})
+    if r.status_code != 200:
+        raise RuntimeError(f"bugboard: скачивание выгрузки — HTTP "
+                           f"{r.status_code}")
+    cards = json.loads(r.text)
+    _cache_put(key, json.dumps(cards, ensure_ascii=False))
+    return cards
+
+
+def _bb_export_status(card):
+    st = card.get("Статус")
+    if isinstance(st, dict):
+        return _bb_status_name(st)
+    text = str(st or "не указан")
+    return re.sub(r"(?<=[а-яё])(?=[А-ЯЁ])", " ", text)
+
+
+def bugboard_search_raw(project, ver, query, limit=20):
+    """Поиск по симптомам: подстрока в заголовке/описании ошибок версии."""
+    limit = max(1, min(int(limit), 50))
+    cards = _bb_export_cards(project, ver)
+    q = (query or "").strip().lower()
+    hits = [c for c in cards
+            if q in " ".join(str(c.get(k, "")) for k in
+                             ("Заголовок", "Описание", "СпособОбхода",
+                              "КодОшибки")).lower()]
+    lines = [f"Поиск «{query}» среди ошибок версии {ver} проекта {project} "
+             f"(bugboard): найдено {len(hits)} из {len(cards)}"]
+    for c in hits[:limit]:
+        lines.append(f"- {c.get('КодОшибки', '?')}: {c.get('Заголовок', '')} — "
+                     f"{_bb_export_status(c)}")
+    if len(hits) > limit:
+        lines.append(f"… и ещё {len(hits) - limit}")
+    if not hits:
+        lines.append("Ничего не найдено. Попробуйте другие слова или соседнюю "
+                     "версию (bugboard_versions).")
+    return "\n".join(lines)
 
 
 def bugboard_versions_raw(project, count=10):
@@ -807,6 +891,17 @@ def bugboard_version_errors(project: str, ver: str, limit: int = 10) -> str:
     limit — сколько карточек читать в каждой группе (1-30; каждая
     карточка — запрос к порталу, по умолчанию 10)."""
     return _safe(bugboard_version_errors_raw, project, ver, limit)
+
+
+@mcp.tool()
+def bugboard_search(project: str, ver: str, query: str, limit: int = 20) -> str:
+    """Поиск ошибок по симптомам: подстрока в заголовке, описании или
+    способе обхода всех ошибок версии конфигурации на bugboard.1c.ru.
+    project — код проекта bugboard (bp3, ssl22), ver — версия (3.0.205.22),
+    query — текст симптома (например «ДиректБанк» или «суточных»).
+    Скачивает полный список ошибок версии одной выгрузкой (кэш на неделю),
+    поэтому повторные запросы быстрые."""
+    return _safe(bugboard_search_raw, project, ver, query, limit)
 
 
 @mcp.tool()

@@ -20,6 +20,7 @@ Context Protocol) поиск и чтение материалов портала
 | `releases_products(query)` | Типовые конфигурации с releases.1c.ru: название, ник, версии |
 | `releases_patches(nick, ver)` | Список исправлений (баг-фиксов `EF_...`) версии конфигурации |
 | `bugboard_card(number, project)` | Карточка ошибки с bugboard.1c.ru по номеру `EF_...` |
+| `bugboard_search(project, ver, query)` | Поиск ошибок по симптомам: текст в заголовках/описаниях всех ошибок версии |
 | `bugboard_version_errors(project, ver)` | Ошибки версии конфигурации: исправленные и открытые |
 | `bugboard_versions(project)` | Последние версии проекта на bugboard |
 | `its_status()` | Самопроверка: источник учётных данных, состояние сессии |
