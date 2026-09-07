@@ -20,8 +20,9 @@ import logging
 import os
 import re
 import time
+import uuid
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 import trafilatura
@@ -151,8 +152,11 @@ mcp = FastMCP(
         "в Markdown по адресу (path) из результата поиска. its_sections — "
         "доступные разделы, its_status — самопроверка. Дополнительно: "
         "releases_products и releases_patches — версии типовых конфигураций "
-        "и списки их исправлений (EF_...) с releases.1c.ru по той же "
-        "подписке. Учётные данные сервер хранит у себя и наружу не отдаёт."
+        "и списки их исправлений (EF_...) с releases.1c.ru; bugboard_card, "
+        "bugboard_version_errors и bugboard_versions — доска ошибок 1С "
+        "(bugboard.1c.ru): карточка ошибки по EF-номеру, ошибки версии "
+        "конфигурации, последние версии. Всё — по той же подписке. "
+        "Учётные данные сервер хранит у себя и наружу не отдаёт."
     ),
 )
 
@@ -501,6 +505,229 @@ def patches_raw(nick, ver):
     return result
 
 
+# ---------------------------------------------------------------- bugboard
+# «1С:Публикация ошибок» (bugboard.1c.ru) — приложение 1С:Элемент.
+# Вход — тихий CAS-переход через сессию ИТС, данные — вызовы серверных
+# методов POST /ui/module/call. Полный протокол: docs/bugboard-protocol.md.
+
+BB_BASE = "https://bugboard.1c.ru"
+BB_AUTH = "https://auth.1cmycloud.com"
+BB_ROUTING = "e1c::bugboard::Основное::Роутинг"
+BB_VERSIONS = "e1c::bugboard::Багборд::Версии"
+BB_REF_PROJECT = "e1c::bugboard::Багборд::Проекты.Reference"
+BB_REF_VERSION = "e1c::bugboard::Багборд::Версии.Reference"
+BB_REF_ERROR = "e1c::bugboard::Багборд::Ошибки.Reference"
+
+BB_STATUS = [
+    "Принята к исправлению", "Исправлена",
+    "Планируется исправление в будущих версиях", "На рассмотрении",
+    "Отложена", "Отклонена", "Отсутствует в будущей версии",
+    "Статус не указан", "Запланированное поведение",
+]
+
+_bb_logged_in = False
+_bb_ver = ""
+
+
+def _bb_login():
+    """Вход на bugboard той же учётной записью, что и в ИТС (без пароля)."""
+    global _bb_logged_in, _bb_ver
+    _ensure_session()  # кука TGC единого входа
+    r = _get(f"{BB_BASE}/")
+    if "auth.1cmycloud.com" not in str(r.url):
+        pass  # сессия ещё жива — сразу снимем версию приложения
+    else:
+        q = parse_qs(urlparse(str(r.url)).query)
+        app_req_id = q.get("app_req_id", [""])[0]
+        app_id = q.get("app_id", [""])[0]
+        caps = _get(f"{BB_AUTH}/auth/v2/server/signin/capabilities",
+                    headers={"X-App-Req-Id": app_req_id}).json()
+        cas = next((s for grp in ("primary", "secondary", "rest")
+                    for s in caps.get("authServices", {}).get(grp, [])
+                    if s.get("serviceType") == "CAS"), None)
+        if not cas:
+            raise RuntimeError("bugboard: CAS-провайдер входа не найден")
+        # app_id обязательно кодировать: в конце base64 стоит '='
+        r = _get(f"{BB_AUTH}/auth/v2/client/cas/{cas['userListId']}/"
+                 f"{cas['serviceId']}"
+                 f"?app_id={quote(app_id, safe='')}&app_req_id={app_req_id}")
+        page = _text(r)
+        grab = lambda i: re.search(rf'id="{i}"[^>]*>([^<]+)<', page).group(1)
+        resp = _post(str(r.url),
+                     data={"app_id": grab("appId"),
+                           "app_req_id": grab("appReqId"),
+                           "token": grab("token")},
+                     headers={"X-App-Req-Id": grab("appReqId")})
+        finish = resp.text.strip().strip('"')
+        if finish.startswith("http"):
+            _get(finish)
+    shell = _text(_get(f"{BB_BASE}/"))
+    h = re.search(r"__gSrv_APP_HASH = '([^']+)'", shell)
+    v = re.search(r"__gSrv_SRV_VERSION = '([^']+)'", shell)
+    if not h or not v:
+        raise RuntimeError("bugboard: вход не завершён — обновился протокол? "
+                           "См. docs/bugboard-protocol.md")
+    _bb_ver = quote(f"{h.group(1)},{v.group(1)}", safe="")
+    _bb_logged_in = True
+
+
+def _bb_ensure(force=False):
+    if _bb_logged_in and not force:
+        return
+    _bb_login()
+
+
+def _bb_call(module, method, params=()):
+    """Вызов серверного метода bugboard (G5 module/call)."""
+    _bb_ensure()
+    body = {"moduleName": module, "methodName": method,
+            "parameters": [{"type": t, "value": v} for t, v in params],
+            "remoteCallerInfo": {"id": str(uuid.uuid4()),
+                                 "debugState": None, "bslStack": []}}
+    resp = _post(f"{BB_BASE}/ui/module/call", json=body,
+                 headers={"X-G5-Version": _bb_ver})
+    if resp.status_code in (401, 403):
+        _bb_login()  # сессия истекла — перезаход и повтор
+        resp = _post(f"{BB_BASE}/ui/module/call", json=body,
+                     headers={"X-G5-Version": _bb_ver})
+    if resp.status_code != 200:
+        raise RuntimeError(f"bugboard/{method}: HTTP {resp.status_code} — "
+                           "протокол мог измениться, см. docs/bugboard-protocol.md")
+    return resp.json().get("result", {})
+
+
+def _bb_read(ref_type, ref_value):
+    """Карточка объекта bugboard (entity/read)."""
+    body = {"reference": {"type": ref_type, "value": ref_value}}
+    resp = _post(f"{BB_BASE}/ui/entity/read", json=body,
+                 headers={"X-G5-Version": _bb_ver})
+    if resp.status_code != 200:
+        raise RuntimeError(f"bugboard entity/read: HTTP {resp.status_code}")
+    return resp.json().get("object", {}).get("value", {})
+
+
+def _bb_status_name(typed):
+    """Укрупнённый статус ошибки: число -> представление."""
+    try:
+        i = int(typed.get("value"))
+        return BB_STATUS[i] if 0 <= i < len(BB_STATUS) else str(i)
+    except (TypeError, ValueError):
+        return "не указан"
+
+
+def _bb_undef(result):
+    return not result or result.get("type") == "Std::Undefined"
+
+
+def _bb_find_project(code):
+    res = _bb_call(BB_ROUTING, "НайтиПроектПоКоду", [("Std::String", code)])
+    if _bb_undef(res):
+        raise RuntimeError(f"Проект «{code}» на bugboard не найден")
+    return res["value"]
+
+
+def _bb_card_md(card):
+    st = _bb_status_name(card.get("УкрупненныйСтатус", {}))
+    lines = [f"# {card.get('Name', '?')} — {card.get('Заголовок', '')}",
+             f"Статус: {st} | Опубликовано: {card.get('ДатаПубликации', '?')}",
+             f"Источник: https://bugboard.1c.ru/?state={card.get('ФрагментСсылки', '')}"]
+    if card.get("ВерсииИсправленияПредставление"):
+        lines.append(f"Продукт: {card['ВерсииИсправленияПредставление']}")
+    if card.get("ПланируемаяДатаИсправления", "") not in ("", "0001-01-01"):
+        lines.append(f"Планируемая дата исправления: "
+                     f"{card['ПланируемаяДатаИсправления']}")
+    if card.get("КодОбращения"):
+        lines.append(f"Обращение: {card['КодОбращения']}")
+    for title, field in (("Описание", "Описание"),
+                         ("Способ обхода", "СпособОбхода"),
+                         ("Способ исправления", "СпособИсправления")):
+        if card.get(field):
+            lines.append(f"\n**{title}.** {card[field]}")
+    return "\n".join(lines)
+
+
+def bugboard_card_raw(number, project=""):
+    s = number.strip()
+    m = re.search(r"state=([\w-]+)", s)
+    if m:
+        state = m.group(1)
+    elif s.startswith("prj-"):
+        state = s
+    else:
+        num = re.sub(r"(?i)^EF_", "", s).replace("_", "-")
+        if not re.match(r"^[\d-]+$", num):
+            return ("Укажите номер вида EF_00_00928768 (или 00-00928768, "
+                    "60033691) и код проекта, либо полную ссылку/адрес страницы.")
+        if not project:
+            return ("Для поиска по номеру нужен код проекта bugboard "
+                    "(второй аргумент, например ssl22 или bp3), "
+                    "либо полная ссылка вида "
+                    "https://bugboard.1c.ru/?state=prj-ssl22-er-00-00928768")
+        state = f"prj-{project}-er-{num}"
+    res = _bb_call(BB_ROUTING, "ПолучитьОшибкуПоФрагментуСсылкиИзURL",
+                   [("Std::String", state)])
+    if _bb_undef(res):
+        return (f"Ошибка «{state}» на bugboard не найдена. Проверьте номер, "
+                "код проекта и что ошибка вообще опубликована на bugboard.")
+    return _bb_card_md(_bb_read(BB_REF_ERROR, res["value"]))
+
+
+def bugboard_versions_raw(project, count=10):
+    count = max(1, min(int(count), 20))
+    key = f"bbversions:{project}:{count}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    proj = _bb_find_project(project)
+    res = _bb_call(BB_VERSIONS, "ПолучитьПревьюВерсийПроекта",
+                   [(BB_REF_PROJECT, proj), ("Std::Number", count)])
+    items = res.get("value", {}).get("items", [])
+    out = []
+    for it in items:
+        card = _bb_read(BB_REF_VERSION, it.get("value"))
+        name = (card.get("Наименование") or card.get("Name")
+                or card.get("Presentation") or str(it.get("value", ""))[:8])
+        out.append(f"- {name}")
+    if not out:
+        return f"Версии проекта {project} не получены."
+    result = f"Последние версии проекта {project} на bugboard:\n" + "\n".join(out)
+    _cache_put(key, result)
+    return result
+
+
+def bugboard_version_errors_raw(project, ver, limit=10):
+    limit = max(1, min(int(limit), 30))
+    key = f"bberrors:{project}:{ver}:{limit}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    proj = _bb_find_project(project)
+    vres = _bb_call(BB_ROUTING, "ПолучитьВерсиюПоНаименованиюИПроекту",
+                    [("Std::String", ver), (BB_REF_PROJECT, proj)])
+    if _bb_undef(vres):
+        return f"Версия {ver} проекта {project} на bugboard не найдена."
+    res = _bb_call(BB_VERSIONS, "ПолучитьМассивОшибокВВерсии",
+                   [(BB_REF_PROJECT, proj), (BB_REF_VERSION, vres["value"])])
+    val = res.get("value", {})
+    groups = (("Исправленные в этой версии", "МассивИсправленныхОшибокВВерсии"),
+              ("Не исправленные (проявляются)", "МассивНеисправленныхОшибокВВерсии"))
+    lines = [f"Проект {project}, версия {ver} (bugboard):"]
+    for label, field in groups:
+        items = val.get(field, {}).get("value", {}).get("items", [])
+        lines.append(f"\n## {label}: {len(items)}")
+        for it in items[:limit]:
+            card = _bb_read(BB_REF_ERROR, it.get("value"))
+            st = _bb_status_name(card.get("УкрупненныйСтатус", {}))
+            lines.append(f"- {card.get('Name', '?')}: "
+                         f"{card.get('Заголовок', '')} — {st}")
+        if len(items) > limit:
+            lines.append(f"… и ещё {len(items) - limit}; полные карточки — "
+                         "bugboard_card по номеру")
+    result = "\n".join(lines)
+    _cache_put(key, result)
+    return result
+
+
 @mcp.tool()
 def its_search(query: str, section: str = "morphmerged") -> str:
     """Поиск по порталу 1С:ИТС. Возвращает заголовки и адреса (path)
@@ -560,6 +787,33 @@ def releases_patches(nick: str, ver: str) -> str:
     releases_products, например nick=Accounting30, ver=3.0.203.24.
     Номер EF_... можно искать на bugboard.1c.ru вручную."""
     return _safe(patches_raw, nick, ver)
+
+
+@mcp.tool()
+def bugboard_card(number: str, project: str = "") -> str:
+    """Карточка ошибки с bugboard.1c.ru (1С:Публикация ошибок): заголовок,
+    описание, статус, способ обхода, план исправления. number — номер
+    вида EF_00_00928768 (или 00-00928768) вместе с кодом проекта
+    (project, например ssl22 или bp3), либо полная строка состояния
+    (prj-ssl22-er-00-00928768) или URL страницы ошибки."""
+    return _safe(bugboard_card_raw, number, project)
+
+
+@mcp.tool()
+def bugboard_version_errors(project: str, ver: str, limit: int = 10) -> str:
+    """Список ошибок версии конфигурации с bugboard.1c.ru: исправленные
+    и неисправленные, с заголовками и статусами. project — код проекта
+    bugboard (например bp3, ssl22), ver — номер версии (3.0.203.24).
+    limit — сколько карточек читать в каждой группе (1-30; каждая
+    карточка — запрос к порталу, по умолчанию 10)."""
+    return _safe(bugboard_version_errors_raw, project, ver, limit)
+
+
+@mcp.tool()
+def bugboard_versions(project: str, count: int = 10) -> str:
+    """Последние версии проекта на bugboard.1c.ru. project — код проекта
+    (например bp3, ssl22)."""
+    return _safe(bugboard_versions_raw, project, count)
 
 
 def main():
