@@ -458,10 +458,18 @@ def products_raw(query=""):
         if not name:
             continue
         seen.add(nick)
-        vers = sorted(set(re.findall(r"\d+\.\d+\.\d+\.\d+", tr)))[-2:]
-        line = f"- {name} — {nick}"
-        if vers:
-            line += f" — версии: {', '.join(vers)}"
+        # ячейки: название | актуальная версия | дата выхода | план. версии |
+        # ориент. сроки | даты обновления плана | ознакомит. | план ознакомит.
+        actual = re.findall(r"\d+\.\d+\.\d+\.\d+", tds[1])[0] if len(tds) > 1 and re.findall(r"\d+\.\d+\.\d+\.\d+", tds[1]) else "?"
+        date = _strip_tags(tds[2]) if len(tds) > 2 else ""
+        if re.match(r"^\d{2}\.\d{2}\.\d{2}$", date):   # 31.08.26 -> 31.08.2026
+            date = date[:-2] + "20" + date[-2:]
+        line = f"- {name} — {nick} — актуальная {actual}"
+        if date:
+            line += f" от {date}"
+        planned = _strip_tags(tds[3]) if len(tds) > 3 else ""
+        if planned and "?" not in planned:
+            line += f" | планируется: {planned}"
         if query and query.lower() not in line.lower():
             continue
         out.append(line)
