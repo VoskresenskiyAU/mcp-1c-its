@@ -154,7 +154,8 @@ mcp = FastMCP(
         "доступные разделы, its_status — самопроверка. Дополнительно: "
         "releases_products, releases_patches и releases_history — версии, "
         "исправления (EF_...) и историю релизов типовых конфигураций "
-        "с releases.1c.ru; bugboard_card, "
+        "с releases.1c.ru; releases_changes — что нового в релизе: требуемая "
+        "версия платформы и перечень изменений; bugboard_card, "
         "bugboard_version_errors и bugboard_versions — доска ошибок 1С "
         "(bugboard.1c.ru): карточка ошибки по EF-номеру, ошибки версии "
         "конфигурации, последние версии. Всё — по той же подписке. "
@@ -595,6 +596,154 @@ def patches_raw(nick, ver):
     return result
 
 
+# ------------------------------------------------- что нового в релизе
+
+def _version_files_facts(nick, ver):
+    """Страница релиза /version_files: (заголовок, предупреждение
+    «Внимание!» о требуемой платформе, href файла «Новое в версии»)."""
+    txt, err = _releases_page("/version_files", nick=nick, ver=ver)
+    if err:
+        raise RuntimeError(err)
+    m = re.search(r'class="section-title">\s*(.*?)</div>', txt, re.S)
+    title = (re.sub(r"\s+", " ", _strip_tags(m.group(1))) if m
+             else f"{nick} {ver}")
+    warn = ""
+    m = re.search(r"Внимание!(.*?)(?=<div)", txt, re.S)
+    if m:
+        warn = _strip_tags(m.group(1))
+    news_href = next((h for h in re.findall(r'href="(/version_file[^"]+)"', txt)
+                      if "news.htm" in h), "")
+    return title, warn, news_href
+
+
+def _changes_report_html(url):
+    """Отчёт «Новое в версии» с news.webits.1c.ru; генератор нередко
+    отвечает 504 на первый запрос — несколько попыток с паузами."""
+    last = ""
+    for attempt in range(4):
+        resp = _get(url, timeout=90)
+        if resp.status_code == 200:
+            return _text(resp)
+        last = f"HTTP {resp.status_code}"
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"отчёт «Новое в версии» недоступен ({last}); "
+                       f"откройте ссылку в браузере: {url}")
+
+
+def changes_raw(nick, ver, details=False):
+    """«Что нового в релизе»: требуемая платформа (минимальная и
+    рекомендованная) со страницы релиза и перечень изменений из отчёта
+    «Новое в версии» (news.webits.1c.ru)."""
+    nick = (nick or "").strip()
+    ver = (ver or "").strip()
+    key = f"changes:{nick}:{ver}:{int(bool(details))}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    title, warn, news_href = _version_files_facts(nick, ver)
+    lines = [f"# {title}",
+             f"Источник: {RELEASES_BASE}/version_files?nick={nick}&ver={ver}"]
+    if warn:
+        lines.append(f"\n**Внимание!** {warn}")
+    if not news_href:
+        lines.append("\nОтчёт «Новое в версии» для этого продукта недоступен "
+                     "(в составе релиза нет файла news.htm).")
+        result = "\n".join(lines)
+        _cache_put(key, result)
+        return result
+    # news.htm отдаётся только с реферером страницы релиза; внутри него -
+    # авто-переход (meta refresh) на отчёт news.webits.1c.ru
+    page_url = f"{RELEASES_BASE}/version_files?nick={nick}&ver={ver}"
+    resp = _get(f"{RELEASES_BASE}{html_lib.unescape(news_href)}",
+                headers={"Referer": page_url})
+    redirect = None
+    html_str = ""
+    if resp.status_code == 200:
+        # news.htm бывает двух видов: авто-переход (meta refresh) на отчёт
+        # news.webits.1c.ru (например, Бухгалтерия) либо сам отчёт (ЗУП)
+        redirect = _meta_refresh_url(_text(resp))
+        if not redirect:
+            lines.append("\n(встроенный отчёт из news.htm)")
+            html_str = _text(resp)
+    if not redirect and not html_str:
+        lines.append("\nНе удалось получить отчёт «Новое в версии» "
+                     f"(HTTP {resp.status_code}).")
+        result = "\n".join(lines)
+        _cache_put(key, result)
+        return result
+    if redirect:
+        lines.append(f"\nПолный отчёт: {redirect}")
+        html_str = _changes_report_html(redirect)
+    return _changes_render(lines, html_str, ver, details, key)
+
+
+def _changes_render(lines, html_str, ver, details, key):
+    """Сводка изменений из html-отчёта: секция версии и перечень пунктов.
+
+    Форматы отчёта: у Version_Changes секции - h3 «Новое в версии X.Y.Z»,
+    пункты - h5/h6; у встроенного news.htm (ЗУП и др.) и секции, и пункты -
+    h3 («Версия X.Y.Z.N» / названия изменений)."""
+    ver_base = ".".join(ver.split(".")[:3])
+
+    def _norm(t):
+        return re.sub(r"\s+", "", t)
+
+    def _is_section(t):
+        # «Новое в версии 3.0.206» / «Версия 3.1.38.92» (без пробелов:
+        # «Новое»+«в»+«версии» склеиваются в «Новоевверсии»)
+        return re.match(r"^(Новоевверсии|Версия)\d", _norm(t)) is not None
+
+    marks = [(m.group(1), _strip_tags(m.group(2)), m.start(), m.end())
+             for m in re.finditer(r"<h([3456])[^>]*>(.*?)</h\1>", html_str,
+                                  re.S | re.I)]
+    # секции/подсекции версий бывают и h3 («Версия …», «Новое в версии …»),
+    # и h4 (подсекции билдов у казахстанских конфигураций)
+    sec_idx = [i for i, (lvl, t, *_) in enumerate(marks) if _is_section(t)]
+    idx = next((i for i in sec_idx if _norm(ver) in _norm(marks[i][1])), None)
+    if idx is None:
+        idx = next((i for i in sec_idx if ver_base in _norm(marks[i][1])), None)
+    if idx is None:
+        idx = sec_idx[0] if sec_idx else 0
+        lines.append(f"\n(раздел версии {ver} в отчёте не найден, показан "
+                     "ближайший)")
+    section_title, section_end = "", None
+    stop_at, items, used = len(html_str), [], 0
+    for j, (lvl, t, start, end) in enumerate(marks[idx:]):
+        if _is_section(t):
+            if section_title:
+                stop_at = start   # началась секция следующей версии
+                break
+            section_title, section_end = t, end
+            continue
+        if not t:
+            continue
+        body = ""
+        if details:
+            k = idx + j + 1
+            frag = (html_str[end:marks[k][2]] if k < len(marks)
+                    else html_str[end:end + 2000])
+            body = _strip_tags(frag)[:400]
+        item = f"- **{t}**" if details else f"- {t}"
+        if details and body:
+            item += f" {body}"
+        items.append(item)
+        used += len(item)
+        if used > 14000:
+            items.append("… (обрезано; полный текст — по ссылке «Полный отчёт»)")
+            break
+    if not items and section_end is not None:
+        # в секции нет подзаголовков: текст изменений лежит сразу после
+        # заголовка секции (казахстанские конфигурации)
+        frag = _strip_tags(html_str[section_end:stop_at])[:1500]
+        if frag:
+            items = [frag]
+    lines.append(f"\n## {section_title or 'Изменения'}")
+    lines.extend(items if items else ["- (изменения не перечислены)"])
+    result = "\n".join(lines)
+    _cache_put(key, result)
+    return result
+
+
 # ---------------------------------------------------------------- bugboard
 # «1С:Публикация ошибок» (bugboard.1c.ru) — приложение 1С:Элемент.
 # Вход — тихий CAS-переход через сессию ИТС, данные — вызовы серверных
@@ -979,6 +1128,17 @@ def releases_patches(nick: str, ver: str) -> str:
     releases_products, например nick=Accounting30, ver=3.0.203.24.
     Номер EF_... можно искать на bugboard.1c.ru вручную."""
     return _safe(patches_raw, nick, ver)
+
+
+@mcp.tool()
+def releases_changes(nick: str, ver: str, details: bool = False) -> str:
+    """Что нового в релизе конфигурации: требуемая версия платформы
+    (минимальная и рекомендованная) из предупреждения на странице релиза
+    releases.1c.ru и перечень изменений из отчёта «Новое в версии»
+    (news.webits.1c.ru). nick и ver — из releases_products или
+    releases_history, например nick=AccountingCorp30, ver=3.0.206.19.
+    details=True — добавлять описания изменений (ответ длиннее)."""
+    return _safe(changes_raw, nick, ver, details)
 
 
 @mcp.tool()
