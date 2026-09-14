@@ -26,7 +26,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
-import trafilatura
 from mcp.server.fastmcp import FastMCP
 
 CRED_FILE_NAME = "its_credentials.txt"
@@ -411,6 +410,8 @@ def get_raw(url_or_path):
         doc = _get(f"{BASE}{src}" if src.startswith("/") else src)
         if doc.status_code == 200:
             body_html = _text(doc)
+    # тяжёлый импорт: нужен только здесь, на старте сервера не тянем
+    import trafilatura
     md = trafilatura.extract(body_html, output_format="markdown",
                              include_links=True, include_tables=True) or ""
     if len(md) < 100:
@@ -487,7 +488,16 @@ def products_raw(query=""):
 
 def _history_versions(nick):
     """Релизы проекта с /project/<nick>, свежие сверху:
-    [(версия, дата, список_обновления_с, мин_платформа), …]."""
+    [(версия, дата, список_обновления_с, мин_платформа), …].
+    Кэшируются на сутки: страница нужна и history_raw, и where_fixed,
+    и releases_changes(since=…)."""
+    key = f"historyver:{nick}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        try:
+            return [tuple(x) for x in json.loads(cached)]
+        except ValueError:            # битый кэш - перечитаем с портала
+            pass
     txt, err = _releases_page(f"/project/{nick}")
     if err:
         raise RuntimeError(err)
@@ -505,6 +515,7 @@ def _history_versions(nick):
     if not out:
         raise RuntimeError(f"Релизы проекта {nick} не найдены — проверьте код "
                            "продукта (releases_products).")
+    _cache_put(key, json.dumps(out))
     return out
 
 
@@ -618,14 +629,14 @@ def _version_files_facts(nick, ver):
 
 def _changes_report_html(url):
     """Отчёт «Новое в версии» с news.webits.1c.ru; генератор нередко
-    отвечает 504 на первый запрос — несколько попыток с паузами."""
+    отвечает 504 на первый запрос — несколько коротких попыток."""
     last = ""
     for attempt in range(4):
-        resp = _get(url, timeout=90)
+        resp = _get(url, timeout=45)
         if resp.status_code == 200:
             return _text(resp)
         last = f"HTTP {resp.status_code}"
-        time.sleep(3 * (attempt + 1))
+        time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"отчёт «Новое в версии» недоступен ({last}); "
                        f"откройте ссылку в браузере: {url}")
 
