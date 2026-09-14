@@ -545,6 +545,9 @@ def where_fixed_raw(nick, number, depth=8):
     версии оно встроено в сам релиз."""
     nick = (nick or "").strip()
     num = re.sub(r"(?i)^EF_", "", (number or "").strip()).replace("_", "-")
+    # в тексте багфиксов номер пишется с подчёркиваниями (EF_00_00932510),
+    # в bugboard - с дефисами: ищем обе формы
+    variants = {num, num.replace("-", "_")}
     depth = max(2, min(int(depth), 15))
     key = f"wherefixed:{nick}:{num}:{depth}"
     cached = _cache_get(key, SEARCH_TTL)
@@ -553,7 +556,8 @@ def where_fixed_raw(nick, number, depth=8):
     versions = [v for v, *_ in _history_versions(nick)][:depth]
     present = []
     for ver in versions:
-        if num in patches_raw(nick, ver):   # списки кэшируются сами
+        txt = patches_raw(nick, ver)   # списки кэшируются сами
+        if any(v in txt for v in variants):
             present.append(ver)
     if not present:
         return (f"Исправление {num} не найдено в багфиксах {len(versions)} "
