@@ -630,13 +630,17 @@ def _changes_report_html(url):
                        f"откройте ссылку в браузере: {url}")
 
 
-def changes_raw(nick, ver, details=False):
+def changes_raw(nick, ver, details=False, since=""):
     """«Что нового в релизе»: требуемая платформа (минимальная и
     рекомендованная) со страницы релиза и перечень изменений из отчёта
-    «Новое в версии» (news.webits.1c.ru)."""
+    «Новое в версии» (news.webits.1c.ru). since — версия, начиная с которой
+    собирать изменения накопительно (обычно наша текущая): в ответ войдут
+    секции всех релизов новее неё, а также перечень релизов, которых этот
+    отчёт не покрывает."""
     nick = (nick or "").strip()
     ver = (ver or "").strip()
-    key = f"changes:{nick}:{ver}:{int(bool(details))}"
+    since = (since or "").strip()
+    key = f"changes:{nick}:{ver}:{int(bool(details))}:{since}"
     cached = _cache_get(key, SEARCH_TTL)
     if cached:
         return cached
@@ -674,11 +678,25 @@ def changes_raw(nick, ver, details=False):
     if redirect:
         lines.append(f"\nПолный отчёт: {redirect}")
         html_str = _changes_report_html(redirect)
-    return _changes_render(lines, html_str, ver, details, key)
+    return _changes_render(lines, html_str, ver, details, key, nick, since)
 
 
-def _changes_render(lines, html_str, ver, details, key):
-    """Сводка изменений из html-отчёта: секция версии и перечень пунктов.
+def _ver_tuple(v):
+    return tuple(int(x) for x in v.split("."))
+
+
+def _ver_cmp(a, b):
+    """Сравнение номеров версий с выравниванием: 3.0.205 < 3.0.205.17."""
+    ta, tb = _ver_tuple(a), _ver_tuple(b)
+    n = max(len(ta), len(tb))
+    ta += (0,) * (n - len(ta))
+    tb += (0,) * (n - len(tb))
+    return (ta > tb) - (ta < tb)
+
+
+def _changes_render(lines, html_str, ver, details, key, nick="", since=""):
+    """Сводка изменений из html-отчёта: секция версии и перечень пунктов;
+    при since — секции всех релизов новее неё (накопительный итог).
 
     Форматы отчёта: у Version_Changes секции - h3 «Новое в версии X.Y.Z»,
     пункты - h5/h6; у встроенного news.htm (ЗУП и др.) и секции, и пункты -
@@ -693,6 +711,10 @@ def _changes_render(lines, html_str, ver, details, key):
         # «Новое»+«в»+«версии» склеиваются в «Новоевверсии»)
         return re.match(r"^(Новоевверсии|Версия)\d", _norm(t)) is not None
 
+    def _sec_ver(t):
+        m = re.search(r"(\d+(?:\.\d+){1,3})", t)
+        return m.group(1) if m else ""
+
     marks = [(m.group(1), _strip_tags(m.group(2)), m.start(), m.end())
              for m in re.finditer(r"<h([3456])[^>]*>(.*?)</h\1>", html_str,
                                   re.S | re.I)]
@@ -706,42 +728,90 @@ def _changes_render(lines, html_str, ver, details, key):
         idx = sec_idx[0] if sec_idx else 0
         lines.append(f"\n(раздел версии {ver} в отчёте не найден, показан "
                      "ближайший)")
-    section_title, section_end = "", None
-    stop_at, items, used = len(html_str), [], 0
-    for j, (lvl, t, start, end) in enumerate(marks[idx:]):
-        if _is_section(t):
-            if section_title:
-                stop_at = start   # началась секция следующей версии
-                break
-            section_title, section_end = t, end
-            continue
-        if not t:
-            continue
-        body = ""
-        if details:
-            k = idx + j + 1
-            frag = (html_str[end:marks[k][2]] if k < len(marks)
-                    else html_str[end:end + 2000])
-            body = _strip_tags(frag)[:400]
-        item = f"- **{t}**" if details else f"- {t}"
-        if details and body:
-            item += f" {body}"
-        items.append(item)
-        used += len(item)
-        if used > 14000:
-            items.append("… (обрезано; полный текст — по ссылке «Полный отчёт»)")
+    # накопительный режим: секции от версии ver вниз до since (не включая);
+    # без since — только сама секция версии ver
+    chosen = []
+    for i in [i for i in sec_idx if i >= idx]:
+        if since:
+            sv = _sec_ver(marks[i][1])
+            if sv and _ver_cmp(sv, since) <= 0:
+                break               # дошли до уже установленной версии
+        chosen.append(i)
+        if not since:
             break
-    if not items and section_end is not None:
-        # в секции нет подзаголовков: текст изменений лежит сразу после
-        # заголовка секции (казахстанские конфигурации)
-        frag = _strip_tags(html_str[section_end:stop_at])[:1500]
-        if frag:
-            items = [frag]
-    lines.append(f"\n## {section_title or 'Изменения'}")
-    lines.extend(items if items else ["- (изменения не перечислены)"])
+    if not chosen:
+        chosen = [idx]
+
+    def _section_items(sec_pos, bound):
+        """Пункты одной секции: от заголовка sec_pos до bound (начало
+        следующей секции или конец файла)."""
+        items, used = [], 0
+        for j, (lvl, t, start, end) in enumerate(marks[sec_pos + 1:], sec_pos + 1):
+            if j in sec_idx or start >= bound:
+                break
+            if not t:
+                continue
+            body = ""
+            if details:
+                k = j + 1
+                frag = (html_str[end:marks[k][2]] if k < len(marks)
+                        else html_str[end:end + 2000])
+                body = _strip_tags(frag)[:400]
+            item = f"- **{t}**" if details else f"- {t}"
+            if details and body:
+                item += f" {body}"
+            items.append(item)
+            used += len(item)
+        if not items:  # текст без подзаголовков (казахстанские релизы)
+            frag = _strip_tags(html_str[marks[sec_pos][3]:bound])[:1500]
+            if frag:
+                items = [frag]
+        return items, used
+
+    budget, truncated = 14000, False
+    for n, i in enumerate(chosen):
+        bound = (marks[chosen[n + 1]][2] if n + 1 < len(chosen)
+                 else _next_bound(sec_idx, i, marks, len(html_str)))
+        items, used = _section_items(i, bound)
+        budget -= used
+        if budget < 0:              # выходим за лимит — режем хвост секции
+            truncated = True
+            while items and budget < 0:
+                budget += len(items[-1]) + 1
+                items.pop()
+        lines.append(f"\n## {marks[i][1] or 'Изменения'}")
+        lines.extend(items if items else ["- (изменения не перечислены)"])
+        if truncated:
+            lines.append("… (обрезано; полный текст — по ссылке «Полный "
+                         "отчёт»)")
+            break
+
+    # какие релизы новее since не покрыты секциями этого отчёта
+    if since and nick:
+        try:
+            covered = {_sec_ver(marks[i][1]) for i in chosen}
+            missed = [v for v, *_ in _history_versions(nick)
+                      if _ver_cmp(v, since) > 0
+                      and not any(v == c or v.startswith(c + ".")
+                                  for c in covered if c)]
+            if missed:
+                lines.append(f"\nНе покрыто этим отчётом (вызовите "
+                             "releases_changes для них отдельно): "
+                             + ", ".join(missed))
+        except RuntimeError:
+            pass
     result = "\n".join(lines)
     _cache_put(key, result)
     return result
+
+
+def _next_bound(sec_idx, i, marks, default):
+    """Начало следующей секции после позиции i — граница последней
+    выбранной секции."""
+    for j in sec_idx:
+        if j > i:
+            return marks[j][2]
+    return default
 
 
 # ---------------------------------------------------------------- bugboard
@@ -1131,14 +1201,18 @@ def releases_patches(nick: str, ver: str) -> str:
 
 
 @mcp.tool()
-def releases_changes(nick: str, ver: str, details: bool = False) -> str:
+def releases_changes(nick: str, ver: str, details: bool = False,
+                     since: str = "") -> str:
     """Что нового в релизе конфигурации: требуемая версия платформы
     (минимальная и рекомендованная) из предупреждения на странице релиза
     releases.1c.ru и перечень изменений из отчёта «Новое в версии»
     (news.webits.1c.ru). nick и ver — из releases_products или
     releases_history, например nick=AccountingCorp30, ver=3.0.206.19.
+    since — версия, установленная у вас (например 3.0.203.24): тогда в
+    ответ войдут секции всех релизов новее неё (накопительный итог
+    обновления), плюс перечень релизов, которых отчёт не покрывает.
     details=True — добавлять описания изменений (ответ длиннее)."""
-    return _safe(changes_raw, nick, ver, details)
+    return _safe(changes_raw, nick, ver, details, since)
 
 
 @mcp.tool()
