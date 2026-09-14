@@ -644,12 +644,16 @@ def changes_raw(nick, ver, details=False, since=""):
     cached = _cache_get(key, SEARCH_TTL)
     if cached:
         return cached
+    if not re.fullmatch(r"\d+(\.\d+){1,3}", ver):
+        return (f"Некорректный номер версии: «{ver}» (ожидается вида "
+                "3.0.206.19). Проверьте releases_history.")
     title, warn, news_href = _version_files_facts(nick, ver)
     lines = [f"# {title}",
              f"Источник: {RELEASES_BASE}/version_files?nick={nick}&ver={ver}"]
     if warn:
         lines.append(f"\n**Внимание!** {warn}")
     if not news_href:
+        # products без news.htm (платформа и пр.) - это не ошибка, кэшируем
         lines.append("\nОтчёт «Новое в версии» для этого продукта недоступен "
                      "(в составе релиза нет файла news.htm).")
         result = "\n".join(lines)
@@ -670,11 +674,11 @@ def changes_raw(nick, ver, details=False, since=""):
             lines.append("\n(встроенный отчёт из news.htm)")
             html_str = _text(resp)
     if not redirect and not html_str:
+        # transient-сбой (сеть, 504 генератора) - НЕ кэшировать: иначе
+        # сообщение о неудаче застрянет на сутки
         lines.append("\nНе удалось получить отчёт «Новое в версии» "
                      f"(HTTP {resp.status_code}).")
-        result = "\n".join(lines)
-        _cache_put(key, result)
-        return result
+        return "\n".join(lines)
     if redirect:
         lines.append(f"\nПолный отчёт: {redirect}")
         html_str = _changes_report_html(redirect)
@@ -718,16 +722,29 @@ def _changes_render(lines, html_str, ver, details, key, nick="", since=""):
     marks = [(m.group(1), _strip_tags(m.group(2)), m.start(), m.end())
              for m in re.finditer(r"<h([3456])[^>]*>(.*?)</h\1>", html_str,
                                   re.S | re.I)]
+    if not marks:
+        result = ("\n".join(lines) + "\n\nСтруктура отчёта не распознана "
+                  "(заголовки разделов не найдены) — вероятно, изменилась "
+                  "разметка портала. Откройте «Полный отчёт» в браузере.")
+        _cache_put(key, result)
+        return result
     # секции/подсекции версий бывают и h3 («Версия …», «Новое в версии …»),
     # и h4 (подсекции билдов у казахстанских конфигураций)
     sec_idx = [i for i, (lvl, t, *_) in enumerate(marks) if _is_section(t)]
+    sec_set = set(sec_idx)
+    if not sec_idx:
+        result = ("\n".join(lines) + "\n\nРазделы версий в отчёте не найдены "
+                  "(«Новое в версии …» / «Версия …») — вероятно, изменилась "
+                  "разметка портала. Откройте «Полный отчёт» в браузере.")
+        _cache_put(key, result)
+        return result
     idx = next((i for i in sec_idx if _norm(ver) in _norm(marks[i][1])), None)
     if idx is None:
         idx = next((i for i in sec_idx if ver_base in _norm(marks[i][1])), None)
     if idx is None:
-        idx = sec_idx[0] if sec_idx else 0
+        idx = sec_idx[0]
         lines.append(f"\n(раздел версии {ver} в отчёте не найден, показан "
-                     "ближайший)")
+                     "первый раздел отчёта)")
     # накопительный режим: секции от версии ver вниз до since (не включая);
     # без since — только сама секция версии ver
     chosen = []
@@ -747,7 +764,7 @@ def _changes_render(lines, html_str, ver, details, key, nick="", since=""):
         следующей секции или конец файла)."""
         items, used = [], 0
         for j, (lvl, t, start, end) in enumerate(marks[sec_pos + 1:], sec_pos + 1):
-            if j in sec_idx or start >= bound:
+            if j in sec_set or start >= bound:
                 break
             if not t:
                 continue
@@ -786,19 +803,20 @@ def _changes_render(lines, html_str, ver, details, key, nick="", since=""):
                          "отчёт»)")
             break
 
-    # какие релизы новее since не покрыты секциями этого отчёта
+    # какие релизы цепочки (since, ver] не покрыты секциями этого отчёта;
+    # верхняя граница ver обязательна: релизы новее ver к цепочке не относятся
     if since and nick:
         try:
             covered = {_sec_ver(marks[i][1]) for i in chosen}
             missed = [v for v, *_ in _history_versions(nick)
-                      if _ver_cmp(v, since) > 0
+                      if _ver_cmp(v, since) > 0 and _ver_cmp(v, ver) <= 0
                       and not any(v == c or v.startswith(c + ".")
                                   for c in covered if c)]
             if missed:
                 lines.append(f"\nНе покрыто этим отчётом (вызовите "
                              "releases_changes для них отдельно): "
                              + ", ".join(missed))
-        except RuntimeError:
+        except RuntimeError:  # история недоступна - блок «не покрыто» опускаем
             pass
     result = "\n".join(lines)
     _cache_put(key, result)
