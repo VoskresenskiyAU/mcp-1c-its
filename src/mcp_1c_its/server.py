@@ -503,15 +503,24 @@ def _history_versions(nick):
         raise RuntimeError(err)
     out = []
     for tr in re.findall(r"<tr[^>]*>.*?</tr>", txt, re.S):
-        tds = [re.findall(r"\d+\.\d+\.\d+\.\d+", td) for td in
-               re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
-        if len(tds) < 4 or not tds[0]:
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)
+        if not cells:
             continue
+        # Версия в первой колонке - 3 или 4 числовые группы (8.3.27.2342,
+        # 3.0.206.19, 2026.1.3 у EDT). У платформы и EDT колонок
+        # "обновление с" и "минимальная платформа" может не быть -
+        # принимаем строку по наличию версии, остальное добираем если есть.
+        ver = re.search(r"\d+(?:\.\d+){2,3}", cells[0])
+        if not ver:
+            continue
+        nums = [re.findall(r"\d+\.\d+\.\d+\.\d+", td) for td in cells]
         m = re.search(r"\d{2}\.\d{2}\.\d{2,4}", tr)
         date = m.group(0) if m else "?"
         if re.match(r"^\d{2}\.\d{2}\.\d{2}$", date):
             date = date[:-2] + "20" + date[-2:]
-        out.append((tds[0][0], date, tds[2], tds[3][0] if tds[3] else "?"))
+        update_from = nums[2] if len(nums) > 2 else []
+        platform = nums[3][0] if len(nums) > 3 and nums[3] else "?"
+        out.append((ver.group(0), date, update_from, platform))
     if not out:
         raise RuntimeError(f"Релизы проекта {nick} не найдены — проверьте код "
                            "продукта (releases_products).")
