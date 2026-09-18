@@ -27,6 +27,12 @@ if not exist "%USERPROFILE%\.1c-its\its_credentials.txt" (
     echo Создан %%USERPROFILE%%\.1c-its\its_credentials.txt — впишите ITS_USER и ITS_PASS.
 )
 
+mkdir "%USERPROFILE%\.1c-its" 2>nul
+if not exist "%USERPROFILE%\.1c-its\buhexpert_credentials.txt" (
+    copy /y buhexpert_credentials.example.txt "%USERPROFILE%\.1c-its\buhexpert_credentials.txt" >nul
+    echo Создан %%USERPROFILE%%\.1c-its\buhexpert_credentials.txt — при наличии подписки Бухэксперт8 впишите BUHEXPERT_USER и BUHEXPERT_PASS.
+)
+
 echo.
 echo Готово. Дальше:
 echo   1. Заполните %%USERPROFILE%%\.1c-its\its_credentials.txt

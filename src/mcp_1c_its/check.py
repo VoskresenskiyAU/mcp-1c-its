@@ -3,13 +3,18 @@
 
     python -m mcp_1c_its.check
 
-Проверяет все три ресурса: ИТС (вход, поиск, материал), releases.1c.ru
-(конфигурации) и bugboard.1c.ru (вход и версии проекта). Логин и пароль
+Проверяет все четыре ресурса: ИТС (вход, поиск, материал), releases.1c.ru
+(конфигурации), bugboard.1c.ru (вход и версии проекта) и buhexpert8.ru
+(поиск, материал; анонимно или по учётной записи подписки). Логин и пароль
 печатаются только в виде «задан/не задан». Код возврата 1 — если хотя
 бы одна часть не работает.
 """
-from .server import (ITS_PASS, ITS_USER, _CRED_SOURCE, _ensure_session,
-                     bugboard_versions_raw, get_raw, products_raw, search_raw)
+import re
+
+from .server import (BE_USER, ITS_PASS, ITS_USER, _CRED_SOURCE, _be_cred_source,
+                     _be_ensure_session, _be_state, _ensure_session,
+                     be_get_raw, be_search_raw, bugboard_versions_raw,
+                     get_raw, products_raw, search_raw)
 
 
 def main():
@@ -50,6 +55,29 @@ def main():
               if len(lines) > 1 else lines[0][:90])
     except Exception as exc:
         print("Ошибка bugboard:", exc)
+        ok = False
+
+    print()
+    print("=== buhexpert8.ru ===")
+    print("Учётные данные подписки:", _be_cred_source)
+    print("BUHEXPERT_USER задан:", bool(BE_USER))
+    try:
+        found = be_search_raw("суточные", 3).splitlines()
+        print("Поиск:", found[0][:90])
+        m = re.search(r"\(id (\d+)\)",
+                      found[2] if len(found) > 2 else "")
+        if m:
+            got = be_get_raw(m.group(1))
+            print(f"Материал (id {m.group(1)}):",
+                  got.splitlines()[0][:90])
+        else:
+            print("Материал: в выдаче нет строк с id")
+        if BE_USER:
+            _be_ensure_session()
+            print("Вход:", "выполнен (доступ подписчика)" if _be_state["ok"]
+                  else _be_state["note"])
+    except Exception as exc:
+        print("Ошибка buhexpert8:", exc)
         ok = False
 
     if not ok:

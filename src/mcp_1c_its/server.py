@@ -12,6 +12,11 @@ ITS_PASS=..., по одной на строку). Файл ищется по п�
 Значения не отдаются наружу: ни в аргументах инструментов, ни в
 ответах, ни в текстах ошибок.
 
+Отдельный необязательный файл buhexpert_credentials.txt (BUHEXPERT_USER=...
+и BUHEXPERT_PASS=..., ищется там же) включает подписочный доступ к
+справочной системе Бухэксперт8 (buhexpert8.ru); без него сервер читает
+buhexpert8.ru анонимно — поиск и открытые материалы.
+
 Запуск (stdio-транспорт): mcp-1c-its  или  python -m mcp_1c_its.server
 """
 import hashlib
@@ -45,6 +50,25 @@ def _cred_candidates():
     yield Path.cwd() / CRED_FILE_NAME
 
 
+def _read_cred_pairs(f):
+    """Словарь «КЛЮЧ=значение» из файла учётных данных; None — не читается."""
+    try:
+        try:
+            text = f.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            text = f.read_text(encoding="cp1251")
+    except OSError:
+        return None
+    pairs = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        pairs[key.strip().upper()] = val.strip().strip('"').strip("'")
+    return pairs
+
+
 def _load_credentials():
     """Читает файл учётных данных.
 
@@ -54,20 +78,9 @@ def _load_credentials():
     for f in _cred_candidates():
         if not f.exists():
             continue
-        from_file = {}
-        try:
-            try:
-                text = f.read_text(encoding="utf-8-sig")
-            except UnicodeDecodeError:
-                text = f.read_text(encoding="cp1251")
-        except OSError:
+        from_file = _read_cred_pairs(f)
+        if from_file is None:
             continue
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            from_file[key.strip().upper()] = val.strip().strip('"').strip("'")
         ITS_USER = from_file.get("ITS_USER", "")
         ITS_PASS = from_file.get("ITS_PASS", "")
         if ITS_PASS:
@@ -158,6 +171,11 @@ mcp = FastMCP(
         "bugboard_version_errors и bugboard_versions — доска ошибок 1С "
         "(bugboard.1c.ru): карточка ошибки по EF-номеру, ошибки версии "
         "конфигурации, последние версии. Всё — по той же подписке. "
+        "Отдельный ресурс (подписка 1С не нужна): buhexpert_search и "
+        "buhexpert_get — справочная система Бухэксперт8 (buhexpert8.ru) по "
+        "1С:Бухгалтерии и 1С:ЗУП: поиск и материалы в Markdown; без учётной "
+        "записи доступны открытые материалы, с учётной записью подписчика "
+        "(файл buhexpert_credentials.txt) — и платные. "
         "Учётные данные сервер хранит у себя и наружу не отдаёт."
     ),
 )
@@ -1162,6 +1180,205 @@ def bugboard_version_errors_raw(project, ver, limit=10):
     return result
 
 
+# ---------------------------------------------------------------- Бухэксперт8
+# buhexpert8.ru — справочная система по 1С:Бухгалтерии и 1С:ЗУП (WordPress).
+# Открытые материалы читаются анонимно через REST API; если в файле
+# buhexpert_credentials.txt заданы логин и пароль подписки, сервер входит
+# (wp-login.php, куки) и берёт полный текст с HTML-страницы: платная
+# часть в REST API не отдаётся. Протокол: docs/buhexpert-api.md
+
+BE_CRED_FILE_NAME = "buhexpert_credentials.txt"
+BE_BASE = "https://buhexpert8.ru"
+BE_USER = ""
+BE_PASS = ""
+_be_state = {"tried": False, "ok": False, "note": ""}
+
+
+def _be_load_credentials():
+    """Читает необязательный файл учётных данных подписки Бухэксперт8
+    (BUHEXPERT_USER=..., BUHEXPERT_PASS=...). Возвращает источник."""
+    global BE_USER, BE_PASS
+    env = os.environ.get("BUHEXPERT_CRED_FILE")
+    candidates = ([Path(env)] if env else
+                  [CONFIG_DIR / BE_CRED_FILE_NAME,
+                   Path.cwd() / BE_CRED_FILE_NAME])
+    for f in candidates:
+        if not f.exists():
+            continue
+        pairs = _read_cred_pairs(f)
+        if pairs is None:
+            continue
+        BE_USER = pairs.get("BUHEXPERT_USER", "")
+        BE_PASS = pairs.get("BUHEXPERT_PASS", "")
+        if BE_USER and BE_PASS:
+            return f"файл {f}"
+    return "не заданы — анонимный доступ (открытые материалы)"
+
+
+_be_cred_source = _be_load_credentials()
+
+
+def _be_ensure_session():
+    """Вход на buhexpert8.ru, если задана учётная запись подписки.
+
+    Возвращает True, если работаем от подписчика. Без учётной записи или
+    после неудачного входа — анонимный доступ; попытка входа не повторяется,
+    чтобы не долбить портал неверным паролем."""
+    if _be_state["tried"]:
+        return _be_state["ok"]
+    _be_state["tried"] = True
+    if not (BE_USER and BE_PASS):
+        return False
+    try:
+        # wp-login.php требует куку wordpress_test_cookie — признак того,
+        # что куки у клиента включены; без неё вход не принимается
+        client.cookies.set("wordpress_test_cookie", "WP Cookie check",
+                           domain="buhexpert8.ru")
+        resp = _post(f"{BE_BASE}/wp-login.php",
+                     data={"log": BE_USER, "pwd": BE_PASS,
+                           "wp-submit": "Log In",
+                           "redirect_to": f"{BE_BASE}/",
+                           "testcookie": "1"},
+                     follow_redirects=False)
+        if any(c.name.startswith("wordpress_logged_in")
+               for c in client.cookies.jar):
+            _be_state["ok"] = True
+        else:
+            err = ""
+            if resp.status_code == 200:
+                m = re.search(r'id="login_error"[^>]*>(.*?)</div>',
+                              _text(resp), re.I | re.S)
+                if m:
+                    err = f": {_strip_tags(m.group(1))[:150]}"
+            _be_state["note"] = (f"вход не удался{err} — анонимный доступ "
+                                 "(проверьте логин и пароль; если вход на "
+                                 "сайте не через wp-login.php, см. "
+                                 "docs/buhexpert-api.md)")
+    except Exception as exc:
+        _be_state["note"] = (f"ошибка входа ({type(exc).__name__}) — "
+                             "анонимный доступ")
+    return _be_state["ok"]
+
+
+def be_search_raw(query, limit=10):
+    """Поиск по buhexpert8.ru через REST API WordPress."""
+    limit = max(1, min(int(limit), 30))
+    key = f"be:search:{query.lower()}:{limit}"
+    cached = _cache_get(key, SEARCH_TTL)
+    if cached:
+        return cached
+    resp = _get(f"{BE_BASE}/wp-json/wp/v2/search",
+                params={"search": query, "per_page": limit,
+                        "type": "post", "subtype": "post"})
+    if resp.status_code != 200:
+        return f"Ошибка поиска Бухэксперт8: HTTP {resp.status_code}"
+    try:
+        items = resp.json()
+    except ValueError:
+        return "Ошибка поиска Бухэксперт8: сайт вернул не-JSON ответ"
+    if isinstance(items, dict):
+        return (f"Ошибка поиска Бухэксперт8: "
+                f"{items.get('message', 'неожиданный ответ')[:200]}")
+    if not items:
+        return "Ничего не найдено. Попробуйте другие слова."
+    lines = [f"Поиск «{query}» на buhexpert8.ru, материалов: {len(items)}",
+             "Текст материала — buhexpert_get (передайте адрес или id)."]
+    for it in items:
+        title = _strip_tags(it.get("title", ""))
+        lines.append(f"- {title} — {it.get('url', '')} (id {it.get('id', '')})")
+    result = "\n".join(lines)
+    _cache_put(key, result)
+    return result
+
+
+def _be_html_to_md(fragment):
+    """Markdown из HTML: фрагмент content.rendered или страница целиком."""
+    if not fragment:
+        return ""
+    # тяжёлый импорт: нужен только здесь, на старте сервера не тянем
+    import trafilatura
+    doc = fragment
+    if "<html" not in fragment[:200].lower():
+        doc = f"<html><body>{fragment}</body></html>"
+    md = trafilatura.extract(doc, output_format="markdown",
+                             include_links=True, include_tables=True) or ""
+    return md.strip()
+
+
+def _be_fetch_post(url_or_id):
+    """Пост buhexpert8.ru по id, адресу или slug: (данные REST, ошибка)."""
+    s = (url_or_id or "").strip()
+    if re.fullmatch(r"\d+", s):
+        rest = f"wp/v2/posts/{s}"
+    else:
+        m = re.search(r"buhexpert8\.ru(/[^\s?#]*)?", s, re.I)
+        path = (m.group(1) if m and m.group(1) else s).strip("/")
+        slug = re.sub(r"\.html?$", "", path.rsplit("/", 1)[-1])
+        if not slug:
+            return None, ("Не удалось определить материал: передайте адрес "
+                          "или id из результата buhexpert_search.")
+        rest = f"wp/v2/posts?slug={quote(slug)}"
+    resp = _get(f"{BE_BASE}/wp-json/{rest}")
+    if resp.status_code != 200:
+        return None, f"Ошибка Бухэксперт8: HTTP {resp.status_code}"
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, "Ошибка Бухэксперт8: сайт вернул не-JSON ответ"
+    if isinstance(data, list):
+        if not data:
+            return None, "Материал не найден (проверьте адрес или id)."
+        data = data[0]
+    return data, None
+
+
+def be_get_raw(url_or_id):
+    """Материал buhexpert8.ru в Markdown: статья, ответ на вопрос, новость."""
+    s = (url_or_id or "").strip()
+    subscribed = _be_ensure_session()
+    key = f"be:get:{'auth' if subscribed else 'anon'}:{s.lower()}"
+    cached = _cache_get(key, CACHE_TTL)
+    if cached:
+        return cached
+    data, err = _be_fetch_post(s)
+    if err:
+        return err
+    title = _strip_tags((data.get("title") or {}).get("rendered", ""))
+    title = title or "без названия"
+    link = data.get("link", "")
+    content = (data.get("content") or {}).get("rendered", "")
+    # у платных материалов в REST лежит заглушка noaccess-block, а не текст
+    paywalled = "noaccess-block" in content
+    md = "" if paywalled else _be_html_to_md(content)
+    if subscribed and link and (paywalled or len(md) < 500):
+        # полный текст подписчика — на HTML-странице: платная часть и ответы
+        # на вопросы в REST не попадают
+        page = _get(link)
+        if page.status_code == 200:
+            page_html = _text(page)
+            if "noaccess-block" not in page_html:
+                page_md = _be_html_to_md(page_html)
+                if len(page_md) > len(md):
+                    md, paywalled = page_md, False
+    head = f"# {title}\nИсточник: {link}\n\n"
+    if paywalled and not md:
+        hint = (f"Материал платный — доступен только подписчикам Бухэксперт8. "
+                "Анонимно сервер читает открытые материалы; для платных "
+                "задайте логин и пароль подписки в файле "
+                "buhexpert_credentials.txt (BUHEXPERT_USER=, BUHEXPERT_PASS=)."
+                if not subscribed else
+                "Материал недоступен и с учётной записью: подписка не "
+                "покрывает этот раздел или истекла. Проверьте подписку "
+                "на buhexpert8.ru.")
+        result = head + hint
+        _cache_put(key, result)
+        return result
+    body = md if md else "(не удалось извлечь текст материала)"
+    result = head + body
+    _cache_put(key, result)
+    return result
+
+
 @mcp.tool()
 def its_search(query: str, section: str = "morphmerged") -> str:
     """Поиск по порталу 1С:ИТС. Возвращает заголовки и адреса (path)
@@ -1194,7 +1411,9 @@ def its_sections() -> str:
 @mcp.tool()
 def its_status() -> str:
     """Самопроверка сервера: откуда взяты учётные данные и заданы ли они
-    (значения не раскрываются), активна ли сессия ИТС."""
+    (значения не раскрываются), активна ли сессия ИТС; отдельным блоком —
+    доступ к Бухэксперт8 (buhexpert8.ru): подписочная учётная запись и
+    состояние входа."""
     lines = [f"Источник учётных данных: {_CRED_SOURCE}",
              f"ITS_USER задан: {bool(ITS_USER)}",
              f"ITS_PASS задан: {bool(ITS_PASS)}"]
@@ -1203,6 +1422,15 @@ def its_status() -> str:
         lines.append("Сессия ИТС: активна")
     except Exception as exc:
         lines.append(f"Сессия ИТС: ошибка — {exc}")
+    lines.append("")
+    lines.append("Бухэксперт8 (buhexpert8.ru):")
+    lines.append(f"Учётные данные подписки: {_be_cred_source}")
+    if _be_ensure_session():
+        lines.append("Вход: выполнен (доступ подписчика, платные материалы)")
+    elif _be_state["note"]:
+        lines.append(f"Вход: {_be_state['note']}")
+    else:
+        lines.append("Режим: анонимный (открытые материалы)")
     return "\n".join(lines)
 
 
@@ -1293,6 +1521,24 @@ def bugboard_versions(project: str, count: int = 10) -> str:
     """Последние версии проекта на bugboard.1c.ru. project — код проекта
     (например bp3, ssl22)."""
     return _safe(bugboard_versions_raw, project, count)
+
+
+@mcp.tool()
+def buhexpert_search(query: str, limit: int = 10) -> str:
+    """Поиск по справочной системе Бухэксперт8 (buhexpert8.ru): статьи,
+    ответы на вопросы и новости по 1С:Бухгалтерии и 1С:ЗУП. Возвращает
+    заголовки, адреса и id; текст материала — buhexpert_get.
+    limit — сколько материалов показать (1-30)."""
+    return _safe(be_search_raw, query, limit)
+
+
+@mcp.tool()
+def buhexpert_get(url_or_id: str) -> str:
+    """Материал Бухэксперт8 в Markdown: статья, ответ на вопрос, новость.
+    url_or_id — адрес (URL) или id из результата buhexpert_search. Без
+    учётной записи подписчика (файл buhexpert_credentials.txt) доступны
+    открытые материалы; с учётной записью — и платные."""
+    return _safe(be_get_raw, url_or_id)
 
 
 def main():
